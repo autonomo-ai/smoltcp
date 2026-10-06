@@ -1602,6 +1602,11 @@ impl<'a> Socket<'a> {
         };
         let control_len = (sent_syn as usize) + (sent_fin as usize);
 
+        // Set when a data segment carries an ACK older than one already processed (the
+        // network reordered it behind a later segment). Its ACK and window are stale and
+        // are ignored, but its payload is still accepted (RFC 9293 3.10.7.4).
+        let mut stale_ack = false;
+
         // Reject unacceptable acknowledgements.
         match (self.state, repr.control, repr.ack_number) {
             // An RST received in response to initial SYN is acceptable if it acknowledges
@@ -1681,7 +1686,20 @@ impl<'a> Socket<'a> {
                     ack_min += 1;
                 }
 
-                if ack_number < ack_min {
+                // An old ACK on a data segment is still acceptable if it is no older than
+                // one transmit buffer (RFC 5961 5.2), so blind injection stays rejected.
+                if ack_number < ack_min
+                    && !sent_syn
+                    && !repr.payload.is_empty()
+                    && ack_number + self.tx_buffer.capacity() >= ack_min
+                {
+                    net_debug!(
+                        "stale ACK ({} < {}) on a data segment; ignoring the ACK, keeping the data",
+                        ack_number,
+                        ack_min
+                    );
+                    stale_ack = true;
+                } else if ack_number < ack_min {
                     net_debug!(
                         "duplicate ACK ({} not in {}...{})",
                         ack_number,
@@ -2065,7 +2083,12 @@ impl<'a> Socket<'a> {
             TcpControl::Syn => 0,
             _ => self.remote_win_scale.unwrap_or(0),
         };
-        let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
+        // A stale segment's window is older than the one already in effect.
+        let new_remote_win_len = if stale_ack {
+            self.remote_win_len
+        } else {
+            (repr.window_len as usize) << (scale as usize)
+        };
         let is_window_update = new_remote_win_len != self.remote_win_len;
         self.remote_win_len = new_remote_win_len;
 
@@ -2088,7 +2111,8 @@ impl<'a> Socket<'a> {
             self.tx_waker.wake();
         }
 
-        if let Some(ack_number) = repr.ack_number {
+        // A stale ACK must not move SND.UNA backwards or count as a duplicate ACK.
+        if let Some(ack_number) = repr.ack_number.filter(|_| !stale_ack) {
             // TODO: When flow control is implemented,
             // refractor the following block within that implementation
 
@@ -5040,6 +5064,78 @@ mod test {
                 ..RECV_TEMPL
             })
         );
+        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
+    }
+
+    #[test]
+    fn test_established_reordered_data_with_stale_ack() {
+        let mut s = socket_established();
+        s.send_slice(b"abcdef").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..RECV_TEMPL
+            }]
+        );
+        // The peer's later segment, acknowledging our data, arrives first.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 3,
+                ack_number: Some(LOCAL_SEQ + 1 + 6),
+                payload: &b"def"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 64,
+                sack_ranges: [None, None, None],
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1 + 6);
+        // The earlier segment, reordered behind it, carries the older ACK and window.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 128,
+                payload: &b"abc"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
+                ..RECV_TEMPL
+            })
+        );
+        // Its data is kept; its ACK and window are ignored.
+        assert_eq!(s.rx_buffer.dequeue_many(6), &b"abcdef"[..]);
+        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1 + 6);
+        assert_eq!(s.remote_win_len, 256);
+        assert_eq!(s.local_rx_dup_acks, 0);
+    }
+
+    #[test]
+    fn test_established_data_with_ack_older_than_tx_buffer() {
+        let mut s = socket_established();
+        // Further back than one transmit buffer: not a reordering, still dropped.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 - 65),
+                payload: &b"abc"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.rx_buffer.len(), 0);
         assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
     }
 
