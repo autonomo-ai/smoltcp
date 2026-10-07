@@ -2154,6 +2154,18 @@ impl<'a> Socket<'a> {
                     );
                 }
 
+                // A data segment carrying the same ACK without moving the window is
+                // not a duplicate ACK (RFC 5681 3.2 requires no data), but it also
+                // does not acknowledge anything new, so it must not reset the count.
+                // A peer that streams data interleaves such segments with its pure
+                // duplicate ACKs; resetting here kept the count below 3 and left
+                // recovery to the RTO (eculink-canstack #1328).
+                Some(last_rx_ack)
+                    if !repr.payload.is_empty()
+                        && last_rx_ack == ack_number
+                        && ack_number < self.remote_last_seq
+                        && !is_window_update => {}
+
                 // No duplicate ACK means we reset the duplicate ACK count
                 // and notify the congestion controller of the fresh ACK
                 _ => {
@@ -7161,8 +7173,8 @@ mod test {
 
         assert_eq!(s.local_rx_dup_acks, 2, "duplicate ACK counter is not set");
 
-        // This packet has content, hence should not be detected
-        // as a duplicate ACK and should reset the duplicate ACK count
+        // This packet has content, hence should not be counted
+        // as a duplicate ACK, and must not reset the duplicate ACK count either
         send!(
             s,
             TcpRepr {
@@ -7184,8 +7196,131 @@ mod test {
         );
 
         assert_eq!(
+            s.local_rx_dup_acks, 2,
+            "same-ACK data segment must neither count nor reset the duplicate ACK count"
+        );
+    }
+
+    /// Peer data segments carrying the same ACK are in-flight data, not duplicate ACKs,
+    /// and must not hide the pure duplicate ACKs interleaved with them.
+    fn dup_ack_socket_with_lost_segment() -> TestSocket {
+        let mut s = socket_established();
+        s.send_slice(b"abc").unwrap(); // This is lost
+        recv!(s, time 1000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abc"[..],
+            ..RECV_TEMPL
+        }));
+        // Normal ACK of previously received segment
+        send!(s, time 1010, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s
+    }
+
+    #[test]
+    fn test_fast_retransmit_dup_acks_interleaved_with_data() {
+        let mut s = dup_ack_socket_with_lost_segment();
+        let dup = |seq| TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + seq,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        };
+        let data = |seq| TcpRepr {
+            payload: &b"xxx"[..],
+            ..dup(seq)
+        };
+
+        send!(s, time 1020, dup(0));
+        send!(s, time 1030, data(0));
+        send!(s, time 1040, dup(3));
+        send!(s, time 1050, data(3));
+        assert_eq!(
+            s.local_rx_dup_acks, 2,
+            "data segments must not reset the count"
+        );
+        send!(s, time 1060, dup(6));
+        assert_eq!(s.local_rx_dup_acks, 3);
+
+        // Third duplicate ACK triggers a fast retransmit, well before the RTO.
+        recv!(s, time 1061, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 6),
+            payload:    &b"abc"[..],
+            window_len: 58,
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_fast_retransmit_never_from_data_only() {
+        let mut s = dup_ack_socket_with_lost_segment();
+        for i in 0..6u32 {
+            send!(s, time 1020 + i * 10, TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + (i * 3) as usize,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"xxx"[..],
+                ..SEND_TEMPL
+            });
+        }
+        assert_eq!(s.local_rx_dup_acks, 0, "data segments must never count");
+        assert!(
+            !matches!(s.timer, Timer::FastRetransmit),
+            "data segments must never trigger a fast retransmit"
+        );
+    }
+
+    #[test]
+    fn test_fast_retransmit_interleaved_count_reset_by_ack_advance() {
+        let mut s = socket_established();
+        s.remote_mss = 3;
+        s.send_slice(b"abcdef").unwrap();
+        recv!(s, time 1000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abc"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1005, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 3,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"def"[..],
+            ..RECV_TEMPL
+        }));
+        send!(s, time 1010, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        send!(s, time 1020, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        send!(s, time 1030, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &b"xxx"[..],
+            ..SEND_TEMPL
+        });
+        send!(s, time 1040, TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + 3,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.local_rx_dup_acks, 2);
+        // The ACK advances: count resets.
+        send!(s, time 1050, TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + 3,
+            ack_number: Some(LOCAL_SEQ + 1 + 3),
+            ..SEND_TEMPL
+        });
+        assert_eq!(
             s.local_rx_dup_acks, 0,
-            "duplicate ACK counter is not reset when receiving data"
+            "an advancing ACK must reset the count"
         );
     }
 
