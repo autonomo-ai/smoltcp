@@ -6,7 +6,7 @@ on:
 jobs:
   notify:
     if: github.repository == 'smoltcp-rs/smoltcp'
-    runs-on: [self-hosted, linux, generalist]
+    runs-on: ${{ fromJSON(vars.CI_GENERIC_RUNNER_LABELS_JSON || '["self-hosted","linux","generalist"]') }}
     continue-on-error: true
     steps:
       - name: send message

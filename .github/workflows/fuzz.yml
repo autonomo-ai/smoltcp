@@ -6,7 +6,7 @@ name: Fuzz
 
 jobs:
   fuzz:
-    runs-on: [self-hosted, linux, generalist]
+    runs-on: ${{ fromJSON(vars.CI_GENERIC_RUNNER_LABELS_JSON || '["self-hosted","linux","generalist"]') }}
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
