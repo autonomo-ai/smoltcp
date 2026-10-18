@@ -6,7 +6,7 @@ name: Coverage
 
 jobs:
   coverage:
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, linux, generalist]
     steps:
       - uses: actions/checkout@v4
       - name: Install `cargo llvm-cov`

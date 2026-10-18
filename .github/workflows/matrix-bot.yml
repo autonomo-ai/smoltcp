@@ -6,7 +6,7 @@ on:
 jobs:
   notify:
     if: github.repository == 'smoltcp-rs/smoltcp'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, generalist]
     continue-on-error: true
     steps:
       - name: send message

@@ -6,7 +6,7 @@ name: Fuzz
 
 jobs:
   fuzz:
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, linux, generalist]
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
